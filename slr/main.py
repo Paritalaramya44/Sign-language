@@ -39,6 +39,23 @@ except ImportError:
     TTS_AVAILABLE = False
     print("WARNING: pyttsx3 not installed. Voice feature will be disabled.")
 
+def mirror_landmark_list(landmark_list, image_width):
+    """
+    Mirror landmark coordinates for left hand to make it appear like right hand
+    """
+    mirrored_landmarks = []
+    for landmark in landmark_list:
+        # Mirror x-coordinate, keep y-coordinate same
+        mirrored_x = image_width - landmark[0]
+        mirrored_landmarks.append([mirrored_x, landmark[1]])
+    return mirrored_landmarks
+
+def get_hand_label(handedness):
+    """
+    Extract hand label (Left/Right) from MediaPipe handedness result
+    """
+    return handedness.classification[0].label
+
 class SentenceBuilder:
     def __init__(self):
         self.sentence = ""
@@ -48,6 +65,12 @@ class SentenceBuilder:
         self.last_add_time = 0
         self.min_add_interval = 0.5  # minimum seconds between adding characters
         
+        # Store predictions for both hands
+        self.left_hand_prediction = ""
+        self.right_hand_prediction = ""
+        self.last_left_time = 0
+        self.last_right_time = 0
+        
         # Initialize TTS if available
         if TTS_AVAILABLE:
             self.tts_engine = pyttsx3.init()
@@ -56,18 +79,34 @@ class SentenceBuilder:
         else:
             self.tts_engine = None
     
-    def add_prediction(self, prediction):
+    def add_prediction(self, prediction, hand_label="Right"):
         current_time = time.time()
         
+        # Store prediction based on hand
+        if hand_label == "Left":
+            self.left_hand_prediction = prediction
+            self.last_left_time = current_time
+        else:
+            self.right_hand_prediction = prediction
+            self.last_right_time = current_time
+        
+        # Use the most recent prediction from either hand
+        if current_time - self.last_left_time < 0.5 and self.left_hand_prediction:
+            active_prediction = self.left_hand_prediction
+        elif current_time - self.last_right_time < 0.5 and self.right_hand_prediction:
+            active_prediction = self.right_hand_prediction
+        else:
+            active_prediction = ""
+        
         # If same prediction as before, check stability
-        if prediction == self.last_prediction and prediction != "":
+        if active_prediction == self.last_prediction and active_prediction != "":
             if current_time - self.prediction_time >= self.stability_threshold:
                 if current_time - self.last_add_time >= self.min_add_interval:
-                    self.add_character(prediction)
+                    self.add_character(active_prediction)
                     self.last_add_time = current_time
         else:
             # New prediction, reset timer
-            self.last_prediction = prediction
+            self.last_prediction = active_prediction
             self.prediction_time = current_time
     
     def add_character(self, character):
@@ -103,13 +142,19 @@ class SentenceBuilder:
     
     def get_sentence(self):
         return self.sentence
+    
+    def get_current_predictions(self):
+        return {
+            "left": self.left_hand_prediction,
+            "right": self.right_hand_prediction
+        }
 
 def draw_sentence_on_image(image, sentence, position=(50, 50)):
     """Draw the current sentence on the image"""
     # Create a semi-transparent overlay for better text visibility
     overlay = image.copy()
     cv.rectangle(overlay, (position[0]-10, position[1]-30), 
-                (len(sentence)*15 + position[0] + 20, position[1]+10), 
+                (len(sentence)*50+ position[0] + 20, position[1]+100), 
                 (0, 0, 0), -1)
     cv.addWeighted(overlay, 0.7, image, 0.3, 0, image)
     
@@ -127,7 +172,9 @@ def draw_instructions(image):
         "BACKSPACE - Delete last char", 
         "DELETE - Clear sentence",
         "ENTER - Speak sentence",
-        "9 - Screenshot"
+        "9 - Screenshot",
+        "",
+        "Both hands supported!"
     ]
     
     start_y = 400
@@ -142,7 +189,10 @@ def main():
     load_dotenv()
     args = get_args()
 
-    keypoint_file = "slr/model/keypoint.csv"
+    # Use new keypoint file if available
+    keypoint_file = "processed_asl_data/asl_keypoint.csv"
+    if not os.path.exists(keypoint_file):
+        keypoint_file = "slr/model/keypoint.csv"
     counter_obj = get_dict_form_list(keypoint_file)
 
     #: cv Capture
@@ -152,7 +202,7 @@ def main():
 
     #: mp Hands
     USE_STATIC_IMAGE_MODE = True
-    MAX_NUM_HANDS = args.max_num_hands
+    MAX_NUM_HANDS = 2  # Enable detection of both hands
     MIN_DETECTION_CONFIDENCE = args.min_detection_confidence
     MIN_TRACKING_CONFIDENCE = args.min_tracking_confidence
 
@@ -191,10 +241,16 @@ def main():
 
     #: -
     #: Load Model
-    keypoint_classifier = KeyPointClassifier()
+    # Use new model if available
+    model_path = "models/asl_model.tflite"
+    if not os.path.exists(model_path):
+        model_path = "slr/model/slr_model.tflite"
+    keypoint_classifier = KeyPointClassifier(model_path)
 
     #: Loading labels
-    keypoint_labels_file = "slr/model/label.csv"
+    keypoint_labels_file = "processed_asl_data/asl_labels.csv"
+    if not os.path.exists(keypoint_labels_file):
+        keypoint_labels_file = "slr/model/label.csv"
     with open(keypoint_labels_file, encoding="utf-8-sig") as f:
         key_points = csv.reader(f)
         keypoint_classifier_labels = [row[0] for row in key_points]
@@ -210,6 +266,7 @@ def main():
     print("DELETE - Clear entire sentence")
     print("ENTER - Speak current sentence (if TTS available)")
     print("9 - Take screenshot")
+    print("Both left and right hands are now supported!")
     
     #: -
     #: Main Loop Start Here...
@@ -265,19 +322,26 @@ def main():
             fps_log_image = show_fps_log(fps_log_image, fps)
 
         #: Initialize prediction variables
-        hand_sign_text = ""
+        hand_predictions = []
 
         #: -
         #: Start Detection
         if results.multi_hand_landmarks is not None:
             for hand_landmarks, handedness in zip(results.multi_hand_landmarks, results.multi_handedness):
+                
+                # Get hand label (Left/Right)
+                hand_label = get_hand_label(handedness)
 
-                #: Calculate  BoundingBox
+                #: Calculate BoundingBox
                 use_brect = True
                 brect = calc_bounding_rect(debug_image, hand_landmarks)
 
                 #: Landmark calculation
                 landmark_list = calc_landmark_list(debug_image, hand_landmarks)
+                
+                # Mirror left hand landmarks to match right hand training data
+                if hand_label == "Left":
+                    landmark_list = mirror_landmark_list(landmark_list, CAP_WIDTH)
 
                 #: Conversion to relative coordinates / normalized coordinates
                 pre_processed_landmark_list = pre_process_landmark(landmark_list)
@@ -293,11 +357,18 @@ def main():
                     else:
                         hand_sign_text = keypoint_classifier_labels[hand_sign_id]
 
-                    #: Add prediction to sentence builder
-                    sentence_builder.add_prediction(hand_sign_text)
+                    #: Add prediction to sentence builder with hand information
+                    sentence_builder.add_prediction(hand_sign_text, hand_label)
+                    
+                    # Store prediction for display
+                    hand_predictions.append({
+                        'text': hand_sign_text,
+                        'hand': hand_label,
+                        'handedness': handedness
+                    })
 
                     #: Showing Result
-                    result_image = show_result(result_image, handedness, hand_sign_text)
+                    result_image = show_result(result_image, handedness, f"{hand_label}: {hand_sign_text}")
 
                 elif MODE == 1:  #: Logging Mode
                     log_keypoints(key, pre_processed_landmark_list, counter_obj, data_limit=1000)
@@ -321,10 +392,14 @@ def main():
                                                 f"Sentence: {current_sentence}", 
                                                 (50, 120))
         
-        #: Draw current prediction
+        #: Draw current predictions for both hands
+        predictions = sentence_builder.get_current_predictions()
         background_image = draw_sentence_on_image(background_image, 
-                                                f"Current: {hand_sign_text}", 
+                                                f"Left: {predictions['left']}", 
                                                 (50, 150))
+        background_image = draw_sentence_on_image(background_image, 
+                                                f"Right: {predictions['right']}", 
+                                                (350, 150))
         
         #: Draw instructions
         background_image = draw_instructions(background_image)
